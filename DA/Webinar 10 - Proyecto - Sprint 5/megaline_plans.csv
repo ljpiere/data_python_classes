@@ -1,0 +1,3 @@
+plan_name,usd_monthly_fee,minutes_included,messages_included,mb_per_month_included,usd_per_minute,usd_per_message,usd_per_gb
+Surf,20,500,50,15360,0.03,0.03,10
+Ultimate,70,3000,1000,30720,0.01,0.01,7
