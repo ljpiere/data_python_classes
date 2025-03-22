@@ -28,6 +28,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Construye la ruta completa al archivo CSV
 csv_path = os.path.join(script_dir, 'olympics.csv')
+#----------------------------------------------------------------------------------
 
 # Lee el archivo CSV
 df = pd.read_csv(csv_path)
