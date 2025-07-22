@@ -3,6 +3,5 @@ import re
 
 URL = 'https://tripleten-com.github.io/simple-shop_es/'
 req_text = requests.get(URL).text
-found_products = re.findall('Nesquik[ \w\-%]+', req_text)
-print(len(found_products))
-print(found_products)
+
+print(req_text)
