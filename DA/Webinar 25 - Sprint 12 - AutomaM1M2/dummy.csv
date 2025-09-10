@@ -1,0 +1,4 @@
+sexo;grupo_edad;etnia;comuna_residencia;region_residencia;prevision;diag1;dias_estada;ano_egreso
+M;25-34;NINGUNA;1101;13;FONASA;J10;3;2023
+F;35-44;NINGUNA;7601;5;ISAPRE;E11;2;2023
+F;25-34;*;7601;5;FONASA;A09;1;2023

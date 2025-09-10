@@ -1,160 +1,137 @@
-import sys
-import getopt
-import pandas as pd
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import os
 import re
+import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import SQLAlchemyError
 
-def parse_arguments():
-    """
-    Analiza los argumentos de la línea de comandos para la ruta del archivo.
-    
-    Devuelve:
-        file_path (str): La ruta del archivo proporcionada por el usuario.
-    """
-    unixOptions = "f:"
-    gnuOptions = ["file="]
+# ---------------------------
+# 1) Parámetros / conexión
+# ---------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="ETL minimal CSV → PostgreSQL")
+    p.add_argument("-f", "--file", required=True, help="Ruta al archivo CSV")
+    p.add_argument("--sep", default=";", help="Separador del CSV (default: ;) ")
+    p.add_argument("--enc", default="latin1", help="Encoding del CSV (default: latin1)")
+    p.add_argument("--table", default="egresos_pacientes", help="Tabla destino")
+    return p.parse_args()
 
-    fullCmdArguments = sys.argv
-    argumentList = fullCmdArguments[1:]  # No incluir el nombre del script
+def pg_engine():
+    # Usa env vars si existen; si no, defaults a airflow/airflow/airflow@localhost:5432
+    user = os.getenv("PGUSER", "airflow")
+    pwd  = os.getenv("PGPASSWORD", "airflow")
+    host = os.getenv("PGHOST", "localhost")
+    port = os.getenv("PGPORT", "5432")
+    db   = os.getenv("PGDATABASE", "airflow")
+    url  = f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+    print(f"[INFO] Conectando a {url}")
+    return create_engine(url)
 
-    try:
-        arguments, values = getopt.getopt(argumentList, unixOptions, gnuOptions)
-    except getopt.error as err:
-        print(str(err))
-        sys.exit(2)
+# ---------------------------
+# 2) Extract
+# ---------------------------
+def extract(csv_path: str, sep: str, enc: str) -> pd.DataFrame:
+    print(f"[INFO] Leyendo CSV: {csv_path}")
+    return pd.read_csv(csv_path, sep=sep, encoding=enc)
 
-    file_path = ''
+def year_from_filename(path: str) -> int | None:
+    # Busca un año de 4 dígitos en el nombre del archivo
+    m = re.search(r"(\d{4})", os.path.basename(path))
+    return int(m.group(1)) if m else None
 
-    for currentArgument, currentValue in arguments:
-        if currentArgument in ("-f", "--file"):
-            file_path = currentValue
-    
-    return file_path
+# ---------------------------
+# 3) Transform (ligero)
+# ---------------------------
+def transform(df: pd.DataFrame, fallback_year: int | None) -> pd.DataFrame:
+    print("[INFO] Transform: limpieza básica")
+    # Normaliza nombres de columnas: minúsculas y sin espacios
+    df.columns = (
+        df.columns.str.strip()
+                  .str.lower()
+                  .str.replace(" ", "_")
+                  .str.replace(r"[^a-z0-9_]", "", regex=True)
+    )
 
-def extract_year_from_path(file_path):
-    # Divide la ruta del archivo en partes
-    year = file_path.split('/')[-1].split('.')[0][-4:]
-    
-    return year
+    # Reemplaza '*' por NaN y elimina filas con demasiados NaN
+    df = df.replace("*", pd.NA)
+    df = df.dropna(axis=0, thresh=max(1, int(df.shape[1] * 0.5)))  # al menos 50% de no-nulos
 
-def data_already_exists(engine, table_name, year):
-    try:
-        with engine.connect() as connection:
-            # Consulta la tabla nueva
-            query = text(f'SELECT * FROM {table_name} WHERE ANO_EGRESO={year}')
-            result = connection.execute(query)
-            exists = result.fetchone() is not None
-    except OperationalError as e:
-            exists = False
-    return exists
+    # Asegura columna de año
+    if "ano_egreso" not in df.columns:
+        if fallback_year is None:
+            print("[WARN] No se detectó año en el nombre del archivo y falta 'ano_egreso' en el CSV.")
+            df["ano_egreso"] = pd.NA
+        else:
+            df["ano_egreso"] = fallback_year
 
-def load_data(file_path):
-    df = pd.read_csv(file_path, encoding='latin1', delimiter=';')
+    # Intenta castear algunas columnas típicas si existen
+    INT_COLS = ["comuna_residencia", "region_residencia", "ano_egreso", "dias_estada"]
+    for c in INT_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
+
+    # Renombres opcionales (ajusta si tu CSV trae otros nombres)
+    RENAME_MAP = {
+        "glosa_comuna_residencia": "comuna_nombre",
+        "glosa_region_residencia": "region_nombre",
+    }
+    df = df.rename(columns={k: v for k, v in RENAME_MAP.items() if k in df.columns})
+
+    # Ejemplo de recorte de columnas para que quede liviano (mantén solo algunas si existen)
+    KEEP = [
+        "sexo", "grupo_edad", "etnia", "comuna_residencia", "comuna_nombre",
+        "region_residencia", "region_nombre", "prevision", "ano_egreso",
+        "diag1", "dias_estada",
+    ]
+    df = df[[c for c in KEEP if c in df.columns]].copy()
+
+    print(f"[INFO] Filas tras limpieza: {len(df)}  |  Columnas: {len(df.columns)}")
     return df
 
-def preprocess_data(df, threshold=0.5):
-    """
-    Preprocesa el DataFrame eliminando las filas en las que la mayoría de las columnas contienen el caracter '*'.
-    
-    Args:
-        df (pd.DataFrame): El DataFrame de entrada.
-        threshold (float): La proporción de columnas que pueden contener '*' antes de que la fila se elimine.
-    
-    Devuelve:
-        pd.DataFrame: El DataFrame limpio.
-    """
+# ---------------------------
+# 4) Load
+# ---------------------------
+def load(df: pd.DataFrame, engine, table: str):
+    print(f"[INFO] Cargando en tabla: {table}")
+    df.to_sql(table, engine, if_exists="append", index=False)
+    print("[INFO] Carga completada")
 
-    ## Elimina filas ausentes
-        ## Calcula el número de columnas
-    num_columns = df.shape[1]
+# ---------------------------
+# 5) Validate
+# ---------------------------
+def validate(engine, table: str):
+    print("[INFO] Validación: conteo por ano_egreso")
+    try:
+        with engine.connect() as con:
+            res = con.execute(text(f"""
+                SELECT ano_egreso, COUNT(*) AS filas
+                FROM {table}
+                GROUP BY ano_egreso
+                ORDER BY ano_egreso
+            """))
+            rows = res.fetchall()
+            if not rows:
+                print("  (sin filas todavía)")
+            for r in rows:
+                print(f"  año={r[0]}  filas={r[1]}")
+    except SQLAlchemyError as e:
+        print(f"[ERROR] Validación falló: {e}")
 
-    # Determina el número de '*' permitidos con base en el umbral especificado (threshold).
-    allowed_stars = int(num_columns * threshold)
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    args = parse_args()
+    engine = pg_engine()
 
-    # Filtra las filas en las que el número de '*' sobrepasa el umbral especificado permitido.
-    cleaned_df = df[df.apply(lambda x: (x == '*').sum() <= allowed_stars, axis=1)]
-    
-    # Formato de los datos
-    cleaned_df.loc[:,'COMUNA_RESIDENCIA'] = cleaned_df['COMUNA_RESIDENCIA'].astype(int)
-    cleaned_df.loc[:,'REGION_RESIDENCIA'] = cleaned_df['REGION_RESIDENCIA'].astype(int)
-    cleaned_df.loc[:,'ANO_EGRESO'] = cleaned_df['ANO_EGRESO'].astype(int)
-    
-    # renombre las columnas
-    new_column_names = ['PERTENENCIA_ESTABLECIMIENTO_SALUD', 'SEXO', 'GRUPO_EDAD', 'ETNIA',
-       'GLOSA_PAIS_ORIGEN', 'COMUNA_RESIDENCIA', 'GLOSA_COMUNA_RESIDENCIA',
-       'REGION_RESIDENCIA', 'GLOSA_REGION_RESIDENCIA', 'PREVISION',
-       'GLOSA_PREVISION', 'ANO_EGRESO', 'DIAG1', 'DIAG2', 'DIAS_ESTADA',
-       'CONDICION_EGRESO', 'INTERV_Q', 'PROCED']
-    old_column_names = cleaned_df.columns
-    
-    column_mapping = dict(zip(old_column_names, new_column_names))
-    cleaned_df.rename(columns=column_mapping, inplace=True)
+    df_raw = extract(args.file, args.sep, args.enc)
+    yr = year_from_filename(args.file)
+    df_t = transform(df_raw, yr)
+    load(df_t, engine, args.table)
+    validate(engine, args.table)
 
-    return cleaned_df
-
-def create_db_engine(db_name):
-    #connection_string = f'sqlite:///{db_name}'
-    #engine = create_engine(connection_string)
-    db_config = {'user': 'arq',         # nombre de usuario
-             'pwd': 'password', # contraseña
-             'host': 'localhost',       # dirección del servidor
-             'port': 5432,              # puerto de conexión
-             'db': 'bd'}             # nombre de la base de datos
-
-    # Crear string de conexión de la base de datos. 
-    connection_string = 'postgresql://{}:{}@{}:{}/{}'.format(db_config['user'],
-                                                                        db_config['pwd'],
-                                                                        db_config['host'],
-                                                                        db_config['port'],
-                                                                        db_config['db'])
-    # Conectarse a la base de datos.
-    engine = create_engine(connection_string)
-    print(f'[INFO]: Connection Checked: {connection_string}')
-    return engine
-
-def save_to_database(df, engine, table_name):
-    df.to_sql(name=table_name, con=engine, if_exists='append', index=False)
-    
-def validate_data(engine, table_name):  
-    with engine.connect() as connection:
-        # Consulta la tabla nueva
-        query = text(f'SELECT ANO_EGRESO, count(*) FROM {table_name} GROUP BY ANO_EGRESO')
-        result = connection.execute(query)
-
-        rows = result.fetchall()
-        for row in rows[:100]:
-            print(row)                    
-      
 if __name__ == "__main__":
-    # Analizar la ruta del archivo a partir de los argumentos de la línea de comandos
-    file_path = parse_arguments()
-    table_name = 'egresos_pacientes'
-    
-    # Carga la base de datos en tu sistema
-    engine = create_db_engine('database/ministerio_de_salud_chile.db')   
-    print('[INFO]: Database connection')
-    
-    if file_path:    
-        print(f"File Path: {file_path}")
-        year = extract_year_from_path(file_path)
-         
-        # Carga tu archivo csv en un DataFrame de Pandas     
-        raw_data = load_data(file_path)
-        print('[INFO]: Load data as a pandas dataframe')
-        
-        # Comprueba si los datos ya están en la base de datos
-        if data_already_exists(engine, table_name, year):
-            print(f"The data already exists in the database. No se realizó ninguna acción.")        
-        else:
-            # Preprocesa los datos:
-            raw_data = preprocess_data(raw_data)
-            print('[INFO]: Preprocess data')
-            
-            # Guarda los datos en una tabla nueva dentro de la base de datos que ya existe   
-            save_to_database(raw_data, engine, table_name)
-            print('[INFO]: Loads data into DB')
-    else:
-        print('No path was provided')
-    
-    validate_data(engine, table_name)
+    main()

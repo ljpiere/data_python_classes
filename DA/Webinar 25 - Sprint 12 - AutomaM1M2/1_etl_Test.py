@@ -6,11 +6,11 @@ from sqlalchemy import create_engine
 
 # Definir los parámetros para conectarse a la base de datos
 # los puedes solicitar al administrador de la base de datos.
-db_config = {'user': 'arq',         # nombre de usuario
-             'pwd': 'password', # contraseña
+db_config = {'user': 'airflow',         # nombre de usuario
+             'pwd': 'airflow', # contraseña
              'host': 'localhost',       # dirección del servidor
              'port': 5432,              # puerto de conexión
-             'db': 'bd'}             # nombre de la base de datos
+             'db': 'airflow'}             # nombre de la base de datos
 
 # Crear string de conexión de la base de datos. 
 connection_string = 'postgresql://{}:{}@{}:{}/{}'.format(db_config['user'],
@@ -22,7 +22,7 @@ connection_string = 'postgresql://{}:{}@{}:{}/{}'.format(db_config['user'],
 engine = create_engine(connection_string)
 
 query = ''' select * 
-            from public."event"
+            from trig_functions
         '''
 
 # Ejecutar la consulta y almacenar el resultado
